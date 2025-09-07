@@ -76,6 +76,41 @@ export default function ApplyPage() {
   const [error, setError] = useState<string | null>(null)
   const [showContactModal, setShowContactModal] = useState(false)
   const router = useRouter();
+
+  // Helper function to check if a field has validation errors
+  const getFieldError = (field: keyof LoanFormData): string | null => {
+    if (field === 'age' && formData.age) {
+      const age = parseInt(formData.age)
+      if (age < 18 || age > 70) {
+        return 'Age should be between 18 and 70'
+      }
+    }
+    if (field === 'experience' && formData.experience) {
+      const experience = parseInt(formData.experience)
+      if (experience > 40) {
+        return 'Work experience cannot exceed 40 years'
+      }
+      if (formData.employment === 'Retired' && experience === 0) {
+        return 'Retired employees must have work experience greater than 0'
+      }
+    }
+    if (field === 'salary' && formData.salary) {
+      const salary = parseFloat(formData.salary)
+      const employmentTypesRequiringSalary = ['Salaried', 'Self-Employed', 'Retired']
+      if (employmentTypesRequiringSalary.includes(formData.employment) && salary < 15000) {
+        return 'Minimum salary should be 15,000'
+      }
+    }
+    if (field === 'cibil_id' && formData.cibil_id) {
+      if (formData.cibil_id.length > 0 && formData.cibil_id.length !== 9) {
+        return 'CIBIL ID should be exactly 9 digits'
+      }
+      if (formData.cibil_id.length === 9 && !/^\d{9}$/.test(formData.cibil_id)) {
+        return 'CIBIL ID should contain only digits'
+      }
+    }
+    return null
+  }
   const [formData, setFormData] = useState<LoanFormData>({
     age: '',
     gender: '',
@@ -88,7 +123,42 @@ export default function ApplyPage() {
   })
 
   const handleInputChange = (field: keyof LoanFormData, value: string) => {
-    setFormData(prev => ({ ...prev, [field]: value }))
+    // Allow typing freely, validate on blur/submit
+    if (field === 'age' || field === 'experience' || field === 'salary') {
+      // Only allow numeric input, but don't restrict the values during typing
+      const numericValue = value.replace(/[^0-9]/g, '')
+      setFormData(prev => ({ ...prev, [field]: numericValue }))
+    } else if (field === 'cibil_id') {
+      // CIBIL ID: only digits, max 9 characters
+      const numericValue = value.replace(/[^0-9]/g, '')
+      if (numericValue.length <= 9) {
+        setFormData(prev => ({ ...prev, [field]: numericValue }))
+      }
+    } else {
+      setFormData(prev => ({ ...prev, [field]: value }))
+    }
+  }
+
+  const validateCibilIdExists = async (cibilId: string): Promise<boolean> => {
+    if (cibilId.length !== 9) {
+      return false
+    }
+    
+    try {
+      // Use the dedicated validation endpoint
+      const response = await fetch(`https://cogni-ml.onrender.com/validate-cibil/${cibilId}`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        }
+      })
+      
+      // If we get a 200, the CIBIL ID exists
+      return response.status === 200
+    } catch (error) {
+      // If there's an error, assume it doesn't exist
+      return false
+    }
   }
 
   const handleSubmit = async () => {
@@ -96,6 +166,47 @@ export default function ApplyPage() {
     setError(null)
     
     try {
+      // CIBIL ID validation: exactly 9 digits
+      if (formData.cibil_id.length !== 9) {
+        throw new Error('CIBIL ID should be exactly 9 digits')
+      }
+
+      // Check if CIBIL ID exists in database first
+      const cibilExists = await validateCibilIdExists(formData.cibil_id)
+      if (!cibilExists) {
+        throw new Error(`CIBIL ID '${formData.cibil_id}' not found in our database. Please verify your CIBIL ID and try again.`)
+      }
+
+      // Age validation: 18-70 years
+      const age = parseInt(formData.age)
+      if (!formData.age || isNaN(age) || age < 18 || age > 70) {
+        throw new Error('Age should be between 18 and 70')
+      }
+
+      // Work experience validation: 0-40 years
+      const experience = parseInt(formData.experience)
+      if (formData.experience === '' || isNaN(experience) || experience < 0 || experience > 40) {
+        throw new Error('Work experience cannot exceed 40 years')
+      }
+
+      // Special rule for retired employees
+      if (formData.employment === 'Retired' && experience === 0) {
+        throw new Error('Retired employees must have work experience greater than 0')
+      }
+
+      // Salary validation: minimum 15,000 for specific employment types
+      const employmentTypesRequiringSalary = ['Salaried', 'Self-Employed', 'Retired']
+      
+      if (employmentTypesRequiringSalary.includes(formData.employment)) {
+        if (!formData.salary) {
+          throw new Error('Salary is required for this employment type')
+        }
+        const salary = parseFloat(formData.salary)
+        if (isNaN(salary) || salary < 15000) {
+          throw new Error('Minimum salary should be 15,000')
+        }
+      }
+
       // Prepare loan application data for the backend
       const loanApplicationData = {
         age: parseInt(formData.age),
@@ -119,14 +230,44 @@ export default function ApplyPage() {
       })
 
       if (!response.ok) {
-        const errorData = await response.json()
-        throw new Error(errorData.detail || 'Failed to process loan application')
+        let errorMessage = 'An error occurred while processing your application'
+        try {
+          const errorData = await response.json()
+          if (errorData && typeof errorData === 'object') {
+            // Handle specific error cases
+            if (response.status === 404) {
+              errorMessage = `CIBIL ID '${formData.cibil_id}' not found in our database. Please verify your CIBIL ID and try again.`
+            } else if (response.status === 400) {
+              errorMessage = errorData.detail || errorData.message || 'Please check your input data and try again'
+            } else if (response.status === 500) {
+              errorMessage = 'Server error occurred. Please try again later.'
+            } else {
+              errorMessage = errorData.detail || errorData.message || errorMessage
+            }
+          }
+        } catch (parseError) {
+          // If JSON parsing fails, use the response status text
+          if (response.status === 404) {
+            errorMessage = `CIBIL ID '${formData.cibil_id}' not found in our database. Please verify your CIBIL ID and try again.`
+          } else {
+            errorMessage = response.statusText || errorMessage
+          }
+        }
+        throw new Error(errorMessage)
       }
 
       const data: LoanResponse = await response.json()
       setResult(data)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred')
+      let errorMessage = 'An error occurred while processing your application'
+      if (err instanceof Error) {
+        errorMessage = err.message
+      } else if (typeof err === 'string') {
+        errorMessage = err
+      } else if (err && typeof err === 'object') {
+        errorMessage = err.toString()
+      }
+      setError(errorMessage)
     } finally {
       setIsLoading(false)
     }
@@ -134,10 +275,54 @@ export default function ApplyPage() {
 
   const validateCurrentStep = () => {
     if (currentStep === 1) {
-      return formData.age && formData.gender && formData.marital_status && formData.education
+      // Basic field presence check
+      if (!formData.age || !formData.gender || !formData.marital_status || !formData.education) {
+        return false
+      }
+      
+      // Age validation
+      const age = parseInt(formData.age)
+      if (isNaN(age) || age < 18 || age > 70) {
+        return false
+      }
+      
+      return true
     }
     if (currentStep === 2) {
-      return formData.employment && formData.experience && formData.salary && formData.cibil_id
+      // Basic field presence check
+      if (!formData.employment || !formData.experience || !formData.cibil_id) {
+        return false
+      }
+      
+      // CIBIL ID validation
+      if (formData.cibil_id.length !== 9) {
+        return false
+      }
+      
+      // Experience validation
+      const experience = parseInt(formData.experience)
+      if (isNaN(experience) || experience < 0 || experience > 40) {
+        return false
+      }
+      
+      // Special rule for retired employees
+      if (formData.employment === 'Retired' && experience === 0) {
+        return false
+      }
+      
+      // Salary validation for specific employment types
+      const employmentTypesRequiringSalary = ['Salaried', 'Self-Employed', 'Retired']
+      if (employmentTypesRequiringSalary.includes(formData.employment)) {
+        if (!formData.salary) {
+          return false
+        }
+        const salary = parseFloat(formData.salary)
+        if (isNaN(salary) || salary < 15000) {
+          return false
+        }
+      }
+      
+      return true
     }
     return true
   }
@@ -486,12 +671,15 @@ export default function ApplyPage() {
                       <Label htmlFor="age" className="text-slate-700 font-medium">Age</Label>
                       <Input
                         id="age"
-                        type="number"
+                        type="text"
                         placeholder="Enter your age"
                         value={formData.age}
                         onChange={(e) => handleInputChange('age', e.target.value)}
                         className="border-blue-200 focus:border-blue-500 focus:ring-blue-500/20 rounded-xl"
                       />
+                      {getFieldError('age') && (
+                        <p className="text-xs text-red-500">{getFieldError('age')}</p>
+                      )}
                     </div>
                     <div className="space-y-2">
                       <Label className="text-slate-700 font-medium">Gender</Label>
@@ -525,6 +713,7 @@ export default function ApplyPage() {
                         </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="High School">High School</SelectItem>
+                          <SelectItem value="Jr. College">Jr. College</SelectItem>
                           <SelectItem value="Diploma">Diploma</SelectItem>
                           <SelectItem value="Bachelor">Bachelor&apos;s Degree</SelectItem>
                           <SelectItem value="Master">Master&apos;s Degree</SelectItem>
@@ -556,33 +745,46 @@ export default function ApplyPage() {
                       <Label htmlFor="experience" className="text-slate-700 font-medium">Work Experience (Years)</Label>
                       <Input
                         id="experience"
-                        type="number"
+                        type="text"
                         placeholder="Enter years of experience"
                         value={formData.experience}
                         onChange={(e) => handleInputChange('experience', e.target.value)}
                         className="border-blue-200 focus:border-blue-500 focus:ring-blue-500/20 rounded-xl"
                       />
+                      {getFieldError('experience') && (
+                        <p className="text-xs text-red-500">{getFieldError('experience')}</p>
+                      )}
                     </div>
                     <div className="space-y-2 md:col-span-2">
                       <Label htmlFor="salary" className="text-slate-700 font-medium">Annual Salary (₹)</Label>
                       <Input
                         id="salary"
-                        type="number"
+                        type="text"
                         placeholder="Enter your annual salary"
                         value={formData.salary}
                         onChange={(e) => handleInputChange('salary', e.target.value)}
                         className="border-blue-200 focus:border-blue-500 focus:ring-blue-500/20 rounded-xl"
                       />
+                      {getFieldError('salary') && (
+                        <p className="text-xs text-red-500">{getFieldError('salary')}</p>
+                      )}
                     </div>
                     <div className="space-y-2 md:col-span-2">
                       <Label htmlFor="cibil_id" className="text-slate-700 font-medium">CIBIL ID</Label>
                       <Input
                         id="cibil_id"
-                        placeholder="Enter your CIBIL ID"
+                        placeholder="Enter your 9-digit CIBIL ID"
                         value={formData.cibil_id}
                         onChange={(e) => handleInputChange('cibil_id', e.target.value)}
                         className="border-blue-200 focus:border-blue-500 focus:ring-blue-500/20 rounded-xl"
+                        maxLength={9}
                       />
+                      <p className="text-xs text-slate-500">
+                        {formData.cibil_id.length}/9 digits
+                        {getFieldError('cibil_id') && (
+                          <span className="text-red-500 ml-2">{getFieldError('cibil_id')}</span>
+                        )}
+                      </p>
                     </div>
                   </div>
                 )}
